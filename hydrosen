@@ -1,0 +1,430 @@
+import tkinter as tk
+import sqlite3
+import random
+from datetime import datetime
+
+DB_NAME = "hydrosentinel.db"
+REFRESH_MS = 5000 
+
+DAM_CONFIG = {
+    "San Roque Dam": {
+        "monitoring": 278.0, "moderate": 280.0, "high": 285.0, "critical": 290.0,
+        "min": 270.0, "max": 292.0, "step": 0.35,
+    },
+    "Ambuklao Dam": {
+        "monitoring": 750.0, "moderate": 752.0, "high": 754.0, "critical": 756.0,
+        "min": 740.0, "max": 758.0, "step": 0.25,
+    },
+}
+
+STATUS_RANK = {"NORMAL": 0, "MONITORING": 1, "MODERATE RISK": 2, "HIGH RISK": 3, "CRITICAL": 4}
+
+FLOOD_WATCH = ["Pantal", "Pogo Chico / Pogo Grande", "Mayombo, Tapuac", "Lasip Chico & Lasip Grande"]
+FLOOD_MODERATE = ["Barangay I, II, III, IV", "Herrero-Perez, Poblacion Oeste", "Caranglaan, Bolosan, Salisay"]
+FLOOD_HIGH = ["Malued - Sitio Fisheries, Calarin", "Lasip Chico & Lasip Grande", "Bacayao Norte / Sur",
+              "Pantal, Pogo Chico/Grande", "Mayombo, Tapuac"]
+FLOOD_ISLAND = ["Lomboy", "Salapingao", "Pugaro, Carael, Calmay"]
+
+
+def compute_status(dam_name, level):
+    cfg = DAM_CONFIG[dam_name]
+    if level >= cfg["critical"]:
+        return "CRITICAL"
+    if level >= cfg["high"]:
+        return "HIGH RISK"
+    if level >= cfg["moderate"]:
+        return "MODERATE RISK"
+    if level >= cfg["monitoring"]:
+        return "MONITORING"
+    return "NORMAL"
+
+
+def status_color(status):
+    if status in ("CRITICAL", "HIGH RISK"):
+        return "#e74c3c"
+    if status in ("MODERATE RISK", "MONITORING"):
+        return "#f39c12"
+    return "#2ecc71"
+
+
+def flood_areas_for_rank(rank):
+    """Return list of (group title, [areas]) for a given severity rank."""
+    if rank <= 0:
+        return []
+    if rank == 1:
+        return [("WATCH LIST - Low-lying areas (possible ankle to knee-deep water)", FLOOD_WATCH)]
+    if rank == 2:
+        return [("MODERATE FLOODED (Knee deep)", FLOOD_MODERATE)]
+    if rank == 3:
+        return [("HIGHLY FLOODED (Chest to waist)", FLOOD_HIGH),
+                ("MODERATE FLOODED (Knee deep)", FLOOD_MODERATE)]
+    return [("HIGHLY FLOODED (Chest to waist)", FLOOD_HIGH),
+            ("MODERATE FLOODED (Knee deep)", FLOOD_MODERATE),
+            ("ISLAND BARANGAYS - Isolation Risk", FLOOD_ISLAND)]
+
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute("PRAGMA table_info(dams)")
+    cols = [row[1] for row in c.fetchall()]
+    if cols and "updated" not in cols:
+        c.execute("DROP TABLE dams")
+
+    c.execute('''CREATE TABLE IF NOT EXISTS dams
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT UNIQUE,
+                  location TEXT,
+                  river TEXT,
+                  distance TEXT,
+                  water_level REAL,
+                  status TEXT,
+                  updated TEXT)''')
+    
+
+    c.execute("SELECT COUNT(*) FROM dams")
+    if c.fetchone()[0] == 0:
+        now = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+        dams_data = [
+            ("San Roque Dam", "San Manuel / San Nicolas, Pangasinan", "Agno River", "~45 km NE",
+             280.8, compute_status("San Roque Dam", 280.8), now),
+            ("Ambuklao Dam", "Bokod, Benguet", "Agno River (Upstream)", "~90 km NE",
+             748.5, compute_status("Ambuklao Dam", 748.5), now),
+        ]
+        c.executemany("INSERT INTO dams VALUES (NULL,?,?,?,?,?,?,?)", dams_data)
+
+    conn.commit()
+    conn.close()
+
+
+def fetch_live_level(dam_name, current_level):
+    """
+    Returns the newest water level (in meters) for a dam.
+
+    Currently SIMULATED (small random movement). To use real data, replace the
+    body of this function with a call to your data source (e.g. PAGASA dam data)
+    and return the level as a float.
+    """
+    cfg = DAM_CONFIG[dam_name]
+    new_level = current_level + random.uniform(-cfg["step"], cfg["step"])
+    return round(max(cfg["min"], min(cfg["max"], new_level)), 2)
+
+
+def update_all_dams():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT name, water_level FROM dams")
+    rows = c.fetchall()
+    now = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+    for name, level in rows:
+        new_level = fetch_live_level(name, level)
+        c.execute("UPDATE dams SET water_level=?, status=?, updated=? WHERE name=?",
+                  (new_level, compute_status(name, new_level), now, name))
+    conn.commit()
+    conn.close()
+
+
+def get_dams():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT name, location, river, distance, water_level, status, updated FROM dams ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+class HydroSentinel:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("HYDRO SENTINEL - Dagupan City Flood Monitoring")
+        self.root.geometry("1100x700")
+        self.root.configure(bg="#eaf6ff")
+
+        init_db()
+
+        self.current_view = "dam"       
+        self.flood_target = None         
+        self.flood_rank_shown = None
+        self.dam_widgets = {}           
+
+        header = tk.Frame(root, bg="#0a4a7a", height=70)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="HYDRO SENTINEL", font=("Arial Black", 22), bg="#0a4a7a", fg="white").pack(side="left", padx=20, pady=10)
+        tk.Label(header, text="Dagupan City | Flood & Dam Early Warning System", font=("Arial", 11), bg="#0a4a7a", fg="#cfe8ff").pack(side="left")
+
+        self.time_label = tk.Label(header, font=("Arial", 11, "bold"), bg="#0a4a7a", fg="white")
+        self.time_label.pack(side="right", padx=20, pady=10)
+        self.update_clock()
+
+        main = tk.Frame(root, bg="#eaf6ff")
+        main.pack(fill="both", expand=True)
+
+        sidebar = tk.Frame(main, bg="#ffffff", width=250)
+        sidebar.pack(side="left", fill="y", padx=10, pady=10)
+        sidebar.pack_propagate(False)
+        tk.Label(sidebar, text="MENU", font=("Arial", 12, "bold"), bg="white", fg="#0a4a7a").pack(pady=15)
+
+        content_wrapper = tk.Frame(main, bg="white")
+        content_wrapper.pack(side="right", fill="both", expand=True, padx=(0, 10), pady=10)
+
+        self.canvas = tk.Canvas(content_wrapper, bg="white", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(content_wrapper, orient="vertical", command=self.canvas.yview)
+        self.content_frame = tk.Frame(self.canvas, bg="white")
+
+        self.content_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        menus = [
+            ("DAM STATUS", self.show_dam),
+            ("FLOOD AREAS", self.show_flood),
+            ("SAFETY TIPS", self.show_tips),
+            ("NEEDS", self.show_needs),
+            ("NEARBY EVACUATION", self.show_evac),
+            ("HOTLINES", self.show_hotlines),
+        ]
+
+        for text, cmd in menus:
+            tk.Button(sidebar, text=text, font=("Arial", 11, "bold"), bg="#0a4a7a", fg="white",
+                      activebackground="#1480d6", relief="flat", height=2, anchor="w", padx=15,
+                      command=cmd, cursor="hand2").pack(fill="x", pady=5, padx=10)
+
+        self.show_dam()
+        self.root.after(REFRESH_MS, self.realtime_tick)
+
+
+    def update_clock(self):
+        now = datetime.now().strftime("%Y-%m-%d  %I:%M:%S %p")
+        self.time_label.config(text=now)
+        self.root.after(1000, self.update_clock)
+
+    def clear_content(self):
+        for w in self.content_frame.winfo_children():
+            w.destroy()
+        self.dam_widgets = {}
+        self.canvas.yview_moveto(0)
+
+    def section_title(self, title, subtitle=""):
+        tk.Label(self.content_frame, text=title, font=("Arial", 18, "bold"), bg="white", fg="#0a4a7a").pack(anchor="w", padx=20, pady=(20, 5))
+        if subtitle:
+            tk.Label(self.content_frame, text=subtitle, font=("Arial", 11), bg="white", fg="gray").pack(anchor="w", padx=20)
+
+
+    def realtime_tick(self):
+        update_all_dams()
+
+        if self.current_view == "dam":
+            for name, loc, river, dist, level, status, updated in get_dams():
+                w = self.dam_widgets.get(name)
+                if w:
+                    w["level"].config(text="Water Level: %.2f m" % level)
+                    w["status"].config(text="STATUS: " + status, bg=status_color(status))
+                    w["updated"].config(text="Last update: " + updated)
+
+        elif self.current_view == "flood_dam":
+            rank = self.current_flood_rank()
+            if rank != self.flood_rank_shown:
+                self.show_dam_flood(self.flood_target)   
+            else:
+                self.refresh_flood_header()
+
+        self.root.after(REFRESH_MS, self.realtime_tick)
+
+    def show_dam(self):
+        self.current_view = "dam"
+        self.clear_content()
+        self.section_title("Dams Monitored for Dagupan", "Real-time water level (auto-refresh every 5 seconds)")
+
+        tk.Button(self.content_frame, text="SHOW FLOODED AREAS - BOTH DAMS",
+                  font=("Arial", 11, "bold"), bg="#c0392b", fg="white", activebackground="#e74c3c",
+                  relief="flat", padx=15, pady=8, cursor="hand2",
+                  command=lambda: self.show_dam_flood(None)).pack(anchor="w", padx=20, pady=(15, 0))
+
+        for name, loc, river, dist, level, status, updated in get_dams():
+            card = tk.Frame(self.content_frame, bg="white", bd=1, relief="solid")
+            card.pack(fill="x", padx=20, pady=8)
+
+            tk.Label(card, text=name, font=("Arial", 13, "bold"), bg="white", fg="#0a4a7a").pack(anchor="w", padx=15, pady=(10, 2))
+            tk.Label(card, text="Location: " + loc, font=("Arial", 9), bg="white", fg="gray").pack(anchor="w", padx=15)
+            tk.Label(card, text="River: " + river, font=("Arial", 9), bg="white").pack(anchor="w", padx=15)
+            tk.Label(card, text="Distance from Dagupan: " + dist, font=("Arial", 9), bg="white").pack(anchor="w", padx=15)
+            lvl = tk.Label(card, text="Water Level: %.2f m" % level, font=("Arial", 10), bg="white")
+            lvl.pack(anchor="w", padx=15, pady=(5, 0))
+            upd = tk.Label(card, text="Last update: " + updated, font=("Arial", 8), bg="white", fg="gray")
+            upd.pack(anchor="w", padx=15)
+            st = tk.Label(card, text="STATUS: " + status, font=("Arial", 11, "bold"),
+                          bg=status_color(status), fg="white", padx=10, pady=3)
+            st.pack(anchor="w", padx=15, pady=(8, 5))
+
+            tk.Button(card, text="SHOW FLOODED AREAS IN DAGUPAN", font=("Arial", 10, "bold"),
+                      bg="#0a4a7a", fg="white", activebackground="#1480d6", relief="flat",
+                      padx=12, pady=6, cursor="hand2",
+                      command=lambda n=name: self.show_dam_flood(n)).pack(anchor="w", padx=15, pady=(0, 12))
+
+            self.dam_widgets[name] = {"level": lvl, "status": st, "updated": upd}
+
+    def current_flood_rank(self):
+        dams = get_dams()
+        if self.flood_target:
+            dams = [d for d in dams if d[0] == self.flood_target]
+        if not dams:
+            return 0
+        return max(STATUS_RANK[d[5]] for d in dams)
+
+    def refresh_flood_header(self):
+        if hasattr(self, "flood_info_label") and self.flood_info_label.winfo_exists():
+            self.flood_info_label.config(text=self.build_info_text())
+
+    def build_info_text(self):
+        dams = get_dams()
+        if self.flood_target:
+            dams = [d for d in dams if d[0] == self.flood_target]
+        lines = []
+        for name, loc, river, dist, level, status, updated in dams:
+            lines.append("%s: %.2f m  |  %s  |  updated %s" % (name, level, status, updated))
+        return "\n".join(lines)
+
+    def show_dam_flood(self, dam_name):
+        self.current_view = "flood_dam"
+        self.flood_target = dam_name
+        self.clear_content()
+
+        title = "Flooded Areas in Dagupan - " + (dam_name if dam_name else "San Roque + Ambuklao (Combined)")
+        self.section_title(title, "Updates automatically as the dam water level changes")
+
+        tk.Button(self.content_frame, text="< BACK TO DAM STATUS", font=("Arial", 10, "bold"),
+                  bg="#eaf6ff", fg="#0a4a7a", relief="flat", padx=10, pady=4, cursor="hand2",
+                  command=self.show_dam).pack(anchor="w", padx=20, pady=(10, 0))
+
+        self.flood_info_label = tk.Label(self.content_frame, text=self.build_info_text(), font=("Arial", 10),
+                                         bg="#f7fbff", justify="left", anchor="w", padx=15, pady=10, bd=1, relief="solid")
+        self.flood_info_label.pack(fill="x", padx=20, pady=10)
+
+        rank = self.current_flood_rank()
+        self.flood_rank_shown = rank
+        status_name = [k for k, v in STATUS_RANK.items() if v == rank][0]
+
+        tk.Label(self.content_frame, text="Overall alert: " + status_name, font=("Arial", 12, "bold"),
+                 bg=status_color(status_name), fg="white", padx=12, pady=4).pack(anchor="w", padx=20, pady=(0, 10))
+
+        groups = flood_areas_for_rank(rank)
+        if not groups:
+            tk.Label(self.content_frame, text="No flooding expected in Dagupan at the current dam level.",
+                     font=("Arial", 11), bg="white", fg="#2ecc71").pack(anchor="w", padx=20, pady=10)
+        else:
+            for gtitle, areas in groups:
+                f = tk.Frame(self.content_frame, bg="white")
+                f.pack(fill="x", padx=20, pady=10)
+                tk.Label(f, text=gtitle, font=("Arial", 11, "bold"), bg="white", fg="#0a4a7a").pack(anchor="w")
+                for a in areas:
+                    tk.Label(f, text=" - " + a, font=("Arial", 10), bg="white").pack(anchor="w", padx=10)
+
+        tk.Label(self.content_frame,
+                 text="Note: San Roque releases water down the Agno River toward Dagupan; Ambuklao is upstream "
+                      "and its releases flow toward San Roque. Always follow CDRRMO and barangay advisories.",
+                 font=("Arial", 9), bg="white", fg="gray", wraplength=700, justify="left").pack(anchor="w", padx=20, pady=15)
+
+    def show_flood(self):
+        self.current_view = "flood"
+        self.clear_content()
+        self.section_title("Flood Affected Areas - Dagupan City", "Based on CDRRMO reports")
+        groups = [
+            ("HIGHLY FLOODED (Chest to waist)", FLOOD_HIGH),
+            ("MODERATE FLOODED (Knee deep)", FLOOD_MODERATE),
+            ("ISLAND BARANGAYS - Isolation Risk", FLOOD_ISLAND),
+        ]
+        for title, areas in groups:
+            f = tk.Frame(self.content_frame, bg="white")
+            f.pack(fill="x", padx=20, pady=10)
+            tk.Label(f, text=title, font=("Arial", 11, "bold"), bg="white", fg="#0a4a7a").pack(anchor="w")
+            for a in areas:
+                tk.Label(f, text=" - " + a, font=("Arial", 10), bg="white").pack(anchor="w", padx=10)
+
+    def show_tips(self):
+        self.current_view = "tips"
+        self.clear_content()
+        self.section_title("Flood Safety Tips")
+        tips = {
+            "BEFORE FLOOD": ["Charge phones, powerbanks, flashlight", "Prepare Go-Bag: docs, meds, food, water", "Elevate appliances, know evac center", "Monitor San Roque Dam & PAGASA"],
+            "DURING FLOOD": ["Turn off electricity & gas", "Do NOT walk/drive through floodwater", "Evacuate early when Barangay says so", "Go to 2nd floor/roof if trapped - call CDRRMO"],
+            "AFTER FLOOD": ["Boil water before drinking", "Check for snakes & live wires", "Clean with disinfectant", "Report damages to Barangay"],
+        }
+        for k, v in tips.items():
+            f = tk.Frame(self.content_frame, bg="white")
+            f.pack(fill="x", padx=20, pady=8)
+            tk.Label(f, text=k, font=("Arial", 11, "bold"), bg="#0a4a7a", fg="white", padx=10, pady=3).pack(anchor="w")
+            for t in v:
+                tk.Label(f, text=" - " + t, font=("Arial", 10), bg="white", anchor="w").pack(fill="x", padx=10, pady=2)
+
+    def show_needs(self):
+        self.current_view = "needs"
+        self.clear_content()
+        self.section_title("Essential Needs During Flood", "Priority needs for evacuees in Dagupan City")
+        needs = [
+            ("Food & Water", "Food Packs, Bigas, Canned Goods, Potable Drinking Water"),
+            ("Hygiene Kits", "Sabon, Shampoo, Toothbrush, Napkin, Diaper, Alcohol, Sanitizer"),
+            ("Health & Medicine", "Medicines, First Aid Kit, Maintenance meds for seniors"),
+            ("Clothing & Shelter", "Clothing, Blankets, Banig, Kulambo, Trapo, Slippers"),
+            ("Power & Light", "Flashlight, Batteries, Powerbank, Candles, Matches, Lighter"),
+            ("Baby Needs", "Baby Milk, Bottles, Diapers, Baby Blanket, Wipes"),
+            ("Rescue & Safety", "Rubber Boat, Life Vest, Whistle, Rope, Emergency Ladder"),
+        ]
+        for title, desc in needs:
+            row = tk.Frame(self.content_frame, bg="#f7fbff", bd=1, relief="solid")
+            row.pack(fill="x", padx=20, pady=6)
+            tk.Label(row, text=title, font=("Arial", 11, "bold"), bg="#f7fbff", width=22, anchor="w").pack(side="left", padx=15, pady=12)
+            tk.Label(row, text=desc, font=("Arial", 10), bg="#f7fbff", fg="#333", anchor="w").pack(side="left", pady=12)
+
+    def show_evac(self):
+        self.current_view = "evac"
+        self.clear_content()
+        self.section_title("Nearby Evacuation Centers - Dagupan City", "2-3 storey buildings accredited by CDRRMO")
+        evac = [
+            ("Dagupan City Astrodome - MAIN", "Poblacion - 100+ families", "MAIN"),
+            ("Bonuan Boquig Evacuation Center", "Bonuan Boquig", "3-Storey"),
+            ("Pugaro Evacuation Center", "Island Brgy. Pugaro", "Island"),
+            ("Salapingao Evacuation Center", "Island Brgy. Salapingao", "Island"),
+            ("West Central I & II Elementary", "Tapuac / Poblacion", "School"),
+            ("North Central Elem - Bonuan Gueset", "Bonuan Gueset", "School"),
+            ("Calmay Elementary Schools", "Calmay Island", "School"),
+            ("Bacayao Sur/Norte Covered Court", "Bacayao", "Court"), 
+        ]
+        for name, loc, tag in evac:
+            row = tk.Frame(self.content_frame, bg="white", bd=1, relief="solid")
+            row.pack(fill="x", padx=20, pady=5)
+            left = tk.Frame(row, bg="white")
+            left.pack(side="left", padx=10, pady=10)
+            tk.Label(left, text=name, font=("Arial", 11, "bold"), bg="white", anchor="w").pack(anchor="w")
+            tk.Label(left, text=loc, font=("Arial", 9), bg="white", fg="gray", anchor="w").pack(anchor="w")
+            tk.Label(row, text=tag, font=("Arial", 8, "bold"), bg="#e1f0ff", fg="#0a4a7a", padx=8, pady=3).pack(side="right", padx=15)
+    
+    def show_hotlines(self):
+        self.current_view = "hotlines"
+        self.clear_content()
+        self.section_title("Emergency Hotlines - Dagupan City", "Call first before posting on social media")
+        hotlines = [
+            ("CDRRMO Dagupan (Main Rescue)", "0968-444-9598 / (075) 540-0363 / 0932-389-1488"),
+            ("Dagupan City Emergency 911", "16-911 / 911"),
+            ("BFP Dagupan (Fire)", "(075) 522-2772 / 0917-184-2611"),
+            ("PNP Dagupan Police", "(075) 523-7463 / (075) 515-3123"),
+            ("Red Cross Pangasinan", "143 / (075) 522-4101"),
+            ("City Health Office", "(075) 522-8203"),
+        ]
+        for name, num in hotlines:
+            row = tk.Frame(self.content_frame, bg="#f7fbff", bd=1, relief="solid")
+            row.pack(fill="x", padx=20, pady=5)
+            tk.Label(row, text=name, font=("Arial", 10, "bold"), bg="#f7fbff", width=35, anchor="w").pack(side="left", padx=10, pady=10)
+            tk.Label(row, text=num, font=("Arial", 11, "bold"), bg="#f7fbff", fg="#c0392b").pack(side="left")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = HydroSentinel(root)
+    root.mainloop()
